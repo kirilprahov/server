@@ -8,14 +8,15 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <pthread.h>
-
+#include <stdatomic.h>
 
 #define BACKLOG 10
 #define HTML_FILE "static/index.html"
 int serverRunning = 1;
 int sockfd;
+worker_pool_t *global_pool = NULL;
 
-void handle_request(int client_fd);
+void handle_request(void *arg);
 int start_server(struct addrinfo hints, struct addrinfo **res, char *port);
 void handle_shutdown(int signum);
 void send_headers(int fd, int code, const char *status, const char *type);
@@ -26,8 +27,6 @@ void send_405(int fd);
 
 int main(int argc, char *argv[])
 {
-	int threadCount = sysconf(_SC_NPROCESSORS_ONLN);
-	pthread_t th[threadCount];
 	char *port = "8080";
 	if (argc == 3 && strcmp(argv[1], "--http-port") == 0)
 	{
@@ -57,13 +56,13 @@ int main(int argc, char *argv[])
 		perror("start_server failed");
 		exit(1);
 	}
-
-	for (int i = 0; i < threadCount; i++)
-	{
-		if (pthread_create(&th[i], NULL, &startThread, NULL) != 0) {
-			perror("Failed to create a thread");
-		}
+	
+	global_pool = worker_pool_create(sysconf(_SC_NPROCESSORS_ONLN));
+	if (global_pool == NULL) {
+		perror("poll failed");
+		exit(1);
 	}
+
 
 	while (serverRunning)
 	{
@@ -74,11 +73,9 @@ int main(int argc, char *argv[])
 			continue;
 		}
 		printf("Client conected\n");
-		Task t = {
-			.taskFunction = &handle_request,
-			.client_fd = new_fd,
-		};
-		submitTask(t);
+
+
+		worker_pool_add_work(global_pool, &handle_request, (void *)(intptr_t)new_fd);
 	}
 
 	close(sockfd);
@@ -118,7 +115,8 @@ int start_server(struct addrinfo hints, struct addrinfo **res, char *port)
 	return 0;
 }
 
-void handle_request(int client_fd) {
+void handle_request(void *arg) {
+	int client_fd = (intptr_t)arg;
 	printf("started to work\n");
 	char buffer[4096];
 	ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
@@ -168,15 +166,15 @@ void handle_request(int client_fd) {
 
 }
 
-void handle_shutdown(int signum)
-{
+void handle_shutdown(int signum) {
 	(void)signum;
 	serverRunning = 0;
-	if (sockfd != -1) {
-		close(sockfd);
-		printf("[+] Server socket closed.\n");
-	}
 
+	if (sockfd != -1) close(sockfd);
+
+	if (global_pool != NULL) {
+		worker_pool_destroy(global_pool);
+	}
 }
 
 void send_headers(int fd, int code, const char *status, const char *type) {
